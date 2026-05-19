@@ -1,0 +1,16 @@
+#!/bin/bash
+
+# Dossier parent qui contient tous tes repos
+REPOS_BASE="/repos/downloaded/directory"
+
+echo "REPOS=("
+
+for REPO_PATH in "$REPOS_BASE"/*/; do
+  # Extraire le nom du dossier comme clé projet
+  PROJECT_KEY=$(basename "$REPO_PATH")
+  # Supprimer le slash final du chemin
+  REPO_PATH="${REPO_PATH%/}"
+  echo "  \"$PROJECT_KEY|$REPO_PATH\""
+done
+
+echo ")"

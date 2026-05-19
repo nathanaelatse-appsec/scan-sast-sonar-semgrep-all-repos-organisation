@@ -1,0 +1,69 @@
+#!/bin/bash
+
+SONAR_HOST_URL="http://localhost:9000"
+SONAR_TOKEN="squ_..."
+OUTPUT_DIR="./rapports"
+
+mkdir -p "$OUTPUT_DIR"
+
+REPOS=(
+ "nom_projet1|/repos/downloaded/directory/nom_projet1" 
+ ...
+ ...
+  "nom_projetn|/repos/downloaded/directory/nom_projetn"
+  
+)
+
+for ENTRY in "${REPOS[@]}"; do
+  PROJECT_KEY="${ENTRY%%|*}"
+  PROJECT_PATH="${ENTRY##*|}"
+
+  echo "========================================"
+  echo "  Traitement : $PROJECT_KEY"
+  echo "========================================"
+
+  # 1. Créer le projet dans SonarQube s'il n'existe pas
+  echo "Création du projet $PROJECT_KEY dans SonarQube..."
+  curl -s -u "$SONAR_TOKEN:" \
+    -X POST \
+    "$SONAR_HOST_URL/api/projects/create" \
+    -d "project=$PROJECT_KEY&name=$PROJECT_KEY" | tee /tmp/sonar_create.json
+
+  # Vérifier si déjà existant ou créé avec succès
+  if grep -q '"errors"' /tmp/sonar_create.json; then
+    echo "Projet déjà existant ou erreur — on continue quand même."
+  else
+    echo "Projet créé avec succès."
+  fi
+
+  # 2. Lancer le scan
+  cd "$PROJECT_PATH" || { echo "Chemin introuvable : $PROJECT_PATH"; continue; }
+
+  sonar-scanner \
+    -Dsonar.projectKey="$PROJECT_KEY" \
+    -Dsonar.sources=. \
+    -Dsonar.host.url="$SONAR_HOST_URL" \
+    -Dsonar.token="$SONAR_TOKEN"
+
+  if [ $? -ne 0 ]; then
+    echo "Scan échoué pour $PROJECT_KEY"
+    continue
+  fi
+
+  sleep 10
+
+  # 3. Exporter les vulnérabilités
+  source ~/Documents/SAST/sonnar-tools/sonar-venv/bin/activate
+
+  sonar-findings-export \
+    -u "$SONAR_HOST_URL" \
+    -t "$SONAR_TOKEN" \
+    -k "$PROJECT_KEY" \
+    --types VULNERABILITY \
+    -f "$OUTPUT_DIR/${PROJECT_KEY}_vulnerabilities.csv"
+
+  echo "Export OK → $OUTPUT_DIR/${PROJECT_KEY}_vulnerabilities.csv"
+done
+
+echo ""
+echo "Tous les scans terminés. Rapports dans : $OUTPUT_DIR"

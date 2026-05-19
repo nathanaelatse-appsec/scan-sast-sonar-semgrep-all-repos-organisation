@@ -1,0 +1,171 @@
+#!/bin/bash
+
+# ==========================================
+# SONARQUBE — Export complet
+# 1. Récupération de la liste des projets
+# 2. Export des vulnérabilités par projet
+# 3. Fusion en un seul CSV
+# ==========================================
+
+# ==========================================
+# CONFIG — À MODIFIER
+# ==========================================
+SONAR_HOST_URL="http://localhost:9000"
+SONAR_TOKEN="squ_..."
+VENV_PATH="$HOME/Documents/SAST/sonnar-tools/sonar-venv/bin/activate"
+PROJECTS_FILE="./projects.txt"
+OUTPUT_DIR="./rapports"
+MERGED_FILE="$OUTPUT_DIR/all_sonar_vulnerabilities.csv"
+LOG_FILE="./export.log"
+
+# ==========================================
+# INIT
+# ==========================================
+mkdir -p "$OUTPUT_DIR"
+echo "" > "$LOG_FILE"
+echo "Démarrage : $(date)" | tee -a "$LOG_FILE"
+echo "" | tee -a "$LOG_FILE"
+
+# Activer le venv
+source "$VENV_PATH"
+if [ $? -ne 0 ]; then
+  echo "ERREUR : impossible d'activer le venv → $VENV_PATH"
+  exit 1
+fi
+
+# ==========================================
+# ÉTAPE 1 — Récupérer la liste des projets
+# ==========================================
+echo "========================================" | tee -a "$LOG_FILE"
+echo "ÉTAPE 1 : Récupération des projets" | tee -a "$LOG_FILE"
+echo "========================================" | tee -a "$LOG_FILE"
+
+curl -s -u "$SONAR_TOKEN:" \
+  "$SONAR_HOST_URL/api/projects/search?ps=500" \
+  | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+projects = data.get('components', [])
+for p in projects:
+    print(p['key'])
+print(f'Projets récupérés : {len(projects)}', file=sys.stderr)
+" > "$PROJECTS_FILE" 2>&1 | tee -a "$LOG_FILE"
+
+if [ ! -s "$PROJECTS_FILE" ]; then
+  echo "ERREUR : impossible de récupérer les projets depuis SonarQube" | tee -a "$LOG_FILE"
+  echo "Vérifiez SONAR_HOST_URL et SONAR_TOKEN" | tee -a "$LOG_FILE"
+  exit 1
+fi
+
+TOTAL_PROJECTS=$(grep -c '.' "$PROJECTS_FILE")
+echo "  ✔ $TOTAL_PROJECTS projets récupérés → $PROJECTS_FILE" | tee -a "$LOG_FILE"
+echo "" | tee -a "$LOG_FILE"
+
+# ==========================================
+# ÉTAPE 2 — Export des vulnérabilités
+# ==========================================
+echo "========================================" | tee -a "$LOG_FILE"
+echo "ÉTAPE 2 : Export des vulnérabilités" | tee -a "$LOG_FILE"
+echo "========================================" | tee -a "$LOG_FILE"
+
+COUNT=0
+SUCCESS=0
+FAILED=0
+
+while IFS= read -r PROJECT_KEY || [ -n "$PROJECT_KEY" ]; do
+
+  # Ignorer lignes vides et commentaires
+  [[ -z "$PROJECT_KEY" || "$PROJECT_KEY" == \#* ]] && continue
+
+  COUNT=$((COUNT + 1))
+  echo "[$COUNT/$TOTAL_PROJECTS] Export : $PROJECT_KEY" | tee -a "$LOG_FILE"
+
+  OUTPUT_FILE="$OUTPUT_DIR/${PROJECT_KEY}_vulnerabilities.csv"
+
+  sonar-findings-export \
+    -u "$SONAR_HOST_URL" \
+    -t "$SONAR_TOKEN" \
+    -k "$PROJECT_KEY" \
+    --types VULNERABILITY \
+    -f "$OUTPUT_FILE" 2>&1 | tee -a "$LOG_FILE"
+
+  if [ -f "$OUTPUT_FILE" ] && [ -s "$OUTPUT_FILE" ]; then
+    LINES=$(wc -l < "$OUTPUT_FILE")
+    echo "  ✔ OK → ${PROJECT_KEY}_vulnerabilities.csv ($LINES lignes)" | tee -a "$LOG_FILE"
+    SUCCESS=$((SUCCESS + 1))
+  else
+    echo "  ✘ ÉCHEC ou aucune vulnérabilité → $PROJECT_KEY" | tee -a "$LOG_FILE"
+    FAILED=$((FAILED + 1))
+  fi
+
+  echo "" | tee -a "$LOG_FILE"
+
+done < "$PROJECTS_FILE"
+
+echo "  Export terminé : $SUCCESS succès / $FAILED échecs" | tee -a "$LOG_FILE"
+echo "" | tee -a "$LOG_FILE"
+
+# ==========================================
+# ÉTAPE 3 — Fusion des CSV
+# ==========================================
+echo "========================================" | tee -a "$LOG_FILE"
+echo "ÉTAPE 3 : Fusion des CSV" | tee -a "$LOG_FILE"
+echo "========================================" | tee -a "$LOG_FILE"
+
+# Vérifier qu'il y a des fichiers à fusionner
+AVAILABLE=$(ls "$OUTPUT_DIR"/*_vulnerabilities.csv 2>/dev/null | grep -v "$MERGED_FILE" | wc -l)
+
+if [ "$AVAILABLE" -eq 0 ]; then
+  echo "  ✘ Aucun fichier CSV à fusionner" | tee -a "$LOG_FILE"
+  exit 1
+fi
+
+echo "  Fichiers à fusionner : $AVAILABLE" | tee -a "$LOG_FILE"
+
+> "$MERGED_FILE"
+HEADER_WRITTEN=false
+MERGED_COUNT=0
+
+for CSV_FILE in "$OUTPUT_DIR"/*_vulnerabilities.csv; do
+
+  [[ "$CSV_FILE" == "$MERGED_FILE" ]] && continue
+
+  PROJECT_NAME=$(basename "$CSV_FILE" "_vulnerabilities.csv")
+
+  if [ "$HEADER_WRITTEN" = false ]; then
+    HEADER=$(head -1 "$CSV_FILE")
+    echo "project,$HEADER" >> "$MERGED_FILE"
+    HEADER_WRITTEN=true
+  fi
+
+  tail -n +2 "$CSV_FILE" | while IFS= read -r LINE; do
+    [[ -z "$LINE" ]] && continue
+    echo "$PROJECT_NAME,$LINE" >> "$MERGED_FILE"
+  done
+
+  MERGED_COUNT=$((MERGED_COUNT + 1))
+  echo "  ✔ Fusionné : $PROJECT_NAME" | tee -a "$LOG_FILE"
+
+done
+
+TOTAL_LINES=$(wc -l < "$MERGED_FILE")
+echo "" | tee -a "$LOG_FILE"
+echo "  ✔ Fichier fusionné → $MERGED_FILE ($TOTAL_LINES lignes)" | tee -a "$LOG_FILE"
+
+# ==========================================
+# RÉSUMÉ FINAL
+# ==========================================
+echo "" | tee -a "$LOG_FILE"
+echo "==========================================" | tee -a "$LOG_FILE"
+echo "RÉSUMÉ FINAL — $(date)" | tee -a "$LOG_FILE"
+echo "------------------------------------------" | tee -a "$LOG_FILE"
+echo "  Projets récupérés  : $TOTAL_PROJECTS" | tee -a "$LOG_FILE"
+echo "  Exports réussis    : $SUCCESS" | tee -a "$LOG_FILE"
+echo "  Exports échoués    : $FAILED" | tee -a "$LOG_FILE"
+echo "  CSV fusionnés      : $MERGED_COUNT" | tee -a "$LOG_FILE"
+echo "  Total findings     : $((TOTAL_LINES - 1))" | tee -a "$LOG_FILE"
+echo "------------------------------------------" | tee -a "$LOG_FILE"
+echo "  Rapports           : $OUTPUT_DIR/" | tee -a "$LOG_FILE"
+echo "  Fichier fusionné   : $MERGED_FILE" | tee -a "$LOG_FILE"
+echo "  Log complet        : $LOG_FILE" | tee -a "$LOG_FILE"
+echo "==========================================" | tee -a "$LOG_FILE"

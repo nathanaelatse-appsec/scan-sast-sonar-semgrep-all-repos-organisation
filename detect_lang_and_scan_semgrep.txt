@@ -1,0 +1,210 @@
+#!/bin/bash
+# detect_lang_and_scan.sh
+
+REPOS_BASE="/repos/downloaded/directory"
+PROJECTS_FILE="./projects.txt"
+OUTPUT_DIR="./rapports-semgrep"
+LOG_FILE="./semgrep_scan.log"
+
+mkdir -p "$OUTPUT_DIR"
+echo "Démarrage : $(date)" > "$LOG_FILE"
+
+# ==========================================
+# MAPPING extension → ruleset Semgrep
+# ==========================================
+declare -A LANG_RULES
+LANG_RULES["java"]="p/java p/owasp-top-ten p/security-audit"
+LANG_RULES["js"]="p/javascript p/nodejs p/owasp-top-ten p/secrets"
+LANG_RULES["ts"]="p/typescript p/nodejs p/owasp-top-ten p/secrets"
+LANG_RULES["py"]="p/python p/django p/flask p/owasp-top-ten p/secrets"
+LANG_RULES["go"]="p/golang p/owasp-top-ten p/secrets"
+LANG_RULES["php"]="p/php p/owasp-top-ten p/secrets"
+LANG_RULES["rb"]="p/ruby p/rails p/owasp-top-ten p/secrets"
+LANG_RULES["cs"]="p/csharp p/owasp-top-ten p/secrets"
+LANG_RULES["kt"]="p/kotlin p/owasp-top-ten p/secrets"
+LANG_RULES["scala"]="p/scala p/owasp-top-ten p/secrets"
+
+# Ruleset de base toujours inclus
+BASE_RULES="p/secrets p/security-audit"
+
+# ==========================================
+# FONCTION : détecter les langages d'un repo
+# ==========================================
+detect_languages() {
+  local REPO_PATH="$1"
+  local DETECTED=()
+
+  for EXT in "${!LANG_RULES[@]}"; do
+    COUNT=$(find "$REPO_PATH" \
+      -not -path "*/node_modules/*" \
+      -not -path "*/vendor/*" \
+      -not -path "*/.git/*" \
+      -name "*.$EXT" | wc -l)
+
+    if [ "$COUNT" -gt 0 ]; then
+      DETECTED+=("$EXT")
+      echo "    Détecté : $EXT ($COUNT fichiers)"
+    fi
+  done
+
+  echo "${DETECTED[@]}"
+}
+
+# ==========================================
+# BOUCLE PRINCIPALE
+# ==========================================
+TOTAL=$(grep -cv '^\s*#\|^\s*$' "$PROJECTS_FILE")
+COUNT=0
+SUCCESS=0
+FAILED=0
+
+while IFS= read -r PROJECT_KEY || [ -n "$PROJECT_KEY" ]; do
+
+  [[ -z "$PROJECT_KEY" || "$PROJECT_KEY" == \#* ]] && continue
+
+  COUNT=$((COUNT + 1))
+  PROJECT_PATH="$REPOS_BASE/$PROJECT_KEY"
+  JSON_FILE="$OUTPUT_DIR/${PROJECT_KEY}.json"
+  CSV_FILE="$OUTPUT_DIR/${PROJECT_KEY}_semgrep.csv"
+
+  echo "" | tee -a "$LOG_FILE"
+  echo "========================================" | tee -a "$LOG_FILE"
+  echo "[$COUNT/$TOTAL] $PROJECT_KEY" | tee -a "$LOG_FILE"
+  echo "========================================" | tee -a "$LOG_FILE"
+
+  if [ ! -d "$PROJECT_PATH" ]; then
+    echo "ERREUR : dossier introuvable → $PROJECT_PATH" | tee -a "$LOG_FILE"
+    FAILED=$((FAILED + 1))
+    continue
+  fi
+
+  # ---- Détecter les langages ----
+  echo "Détection des langages..." | tee -a "$LOG_FILE"
+  DETECTED_LANGS=($(detect_languages "$PROJECT_PATH"))
+
+  if [ ${#DETECTED_LANGS[@]} -eq 0 ]; then
+    echo "  ⚠ Aucun langage reconnu, utilisation des règles de base." | tee -a "$LOG_FILE"
+    RULESETS="$BASE_RULES"
+  else
+    echo "  Langages détectés : ${DETECTED_LANGS[*]}" | tee -a "$LOG_FILE"
+
+    # Construire la liste des rulesets sans doublons
+    RULESETS="$BASE_RULES"
+    for LANG in "${DETECTED_LANGS[@]}"; do
+      RULESETS="$RULESETS ${LANG_RULES[$LANG]}"
+    done
+
+    # Dédupliquer
+    RULESETS=$(echo "$RULESETS" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+  fi
+
+  echo "  Rulesets appliqués : $RULESETS" | tee -a "$LOG_FILE"
+
+  # ---- Scan Semgrep ----
+  echo "Scan en cours..." | tee -a "$LOG_FILE"
+
+  semgrep scan \
+    $(echo "$RULESETS" | xargs -n1 echo --config) \
+    --json \
+    --output "$JSON_FILE" \
+    --timeout 60 \
+    --max-memory 2048 \
+    --jobs 4 \
+    --exclude "node_modules" \
+    --exclude "vendor" \
+    --exclude "*.min.js" \
+    --exclude "*.lock" \
+    "$PROJECT_PATH" 2>&1 | tee -a "$LOG_FILE"
+
+  SCAN_STATUS=${PIPESTATUS[0]}
+
+  if [ $SCAN_STATUS -ne 0 ] || [ ! -f "$JSON_FILE" ]; then
+    echo "  ✘ Scan échoué : $PROJECT_KEY" | tee -a "$LOG_FILE"
+    FAILED=$((FAILED + 1))
+    continue
+  fi
+
+  echo "  ✔ Scan OK" | tee -a "$LOG_FILE"
+
+  # ---- Conversion JSON → CSV ----
+  python3 - <<EOF
+import json, csv, sys
+
+json_file = "$JSON_FILE"
+csv_file  = "$CSV_FILE"
+project   = "$PROJECT_KEY"
+
+try:
+    with open(json_file) as f:
+        data = json.load(f)
+
+    findings = data.get("results", [])
+
+    with open(csv_file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "project", "language", "rule_id", "severity", "category",
+            "file", "line_start", "line_end", "message", "cwe"
+        ])
+        for r in findings:
+            meta     = r.get("extra", {}).get("metadata", {})
+            severity = r.get("extra", {}).get("severity", "")
+            cwe      = meta.get("cwe", "")
+            if isinstance(cwe, list):
+                cwe = " | ".join(cwe)
+
+            # Déduire le langage depuis l'extension du fichier
+            path = r.get("path", "")
+            ext  = path.rsplit(".", 1)[-1] if "." in path else "unknown"
+
+            writer.writerow([
+                project,
+                ext,
+                r.get("check_id", ""),
+                severity,
+                meta.get("category", ""),
+                path,
+                r.get("start", {}).get("line", ""),
+                r.get("end",   {}).get("line", ""),
+                r.get("extra", {}).get("message", "").replace("\n", " "),
+                cwe
+            ])
+
+    print(f"  ✔ CSV généré : {len(findings)} findings → {csv_file}")
+
+except Exception as e:
+    print(f"  ERREUR conversion : {e}")
+    sys.exit(1)
+EOF
+
+  [ $? -eq 0 ] && SUCCESS=$((SUCCESS + 1)) || FAILED=$((FAILED + 1))
+
+done < "$PROJECTS_FILE"
+
+# ==========================================
+# FUSION
+# ==========================================
+MERGED="$OUTPUT_DIR/all_semgrep_findings.csv"
+HEADER_WRITTEN=false
+> "$MERGED"
+
+for CSV_FILE in "$OUTPUT_DIR"/*_semgrep.csv; do
+  [[ "$CSV_FILE" == "$MERGED" ]] && continue
+  if [ "$HEADER_WRITTEN" = false ]; then
+    head -1 "$CSV_FILE" >> "$MERGED"
+    HEADER_WRITTEN=true
+  fi
+  tail -n +2 "$CSV_FILE" >> "$MERGED"
+done
+
+# ==========================================
+# RÉSUMÉ
+# ==========================================
+echo "" | tee -a "$LOG_FILE"
+echo "==========================================" | tee -a "$LOG_FILE"
+echo "RÉSUMÉ — $(date)" | tee -a "$LOG_FILE"
+echo "  Projets traités : $COUNT / $TOTAL" | tee -a "$LOG_FILE"
+echo "  Succès          : $SUCCESS" | tee -a "$LOG_FILE"
+echo "  Échecs          : $FAILED" | tee -a "$LOG_FILE"
+echo "  Fusionné        : $MERGED" | tee -a "$LOG_FILE"
+echo "==========================================" | tee -a "$LOG_FILE"
