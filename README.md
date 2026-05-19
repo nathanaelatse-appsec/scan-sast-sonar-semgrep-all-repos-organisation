@@ -1,7 +1,7 @@
 # scan-sast-sonar-semgrep-all-repos-organisation en local
 Ceci est un projet qui permet de faire le scan de vulnerabilite d une organisation avec les version communities de sonar et semgrep
 
-***Changer tout les .txt en .sh avant execution***
+***Changer tous les .txt en .sh avant execution***
 
 ## Mise place de l'environnement
 
