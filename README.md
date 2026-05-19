@@ -159,7 +159,4 @@ chmod +x detect_lang_and_scan_semgrep.sh
 
 
 
-
-note je dois combiner la recuperation du rapport. obtenir en sortis ne donne qu un fichier csv
-
-dans la perspective d evolution, je dois aboutir au lancement des deux scan et recup des rapport en un seul lancement de script
+dans la perspective d'evolution, je dois aboutir au lancement des deux scan et recup des rapport en un seul lancement de script
